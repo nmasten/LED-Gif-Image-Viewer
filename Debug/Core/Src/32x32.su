@@ -1,0 +1,4 @@
+../Core/Src/32x32.c:10:6:set_pixel	40	static
+../Core/Src/32x32.c:26:6:set_pixel_8bit	24	static
+../Core/Src/32x32.c:33:6:set_pixels_u32	32	static
+../Core/Src/32x32.c:42:6:clear_led_matrix	24	static

@@ -1,0 +1,301 @@
+@@ -1,7 +1,7 @@
+ /**
+   ******************************************************************************
+   * File Name          : main.c
+-  * Date               : 12/03/2015 21:32:14
++  * Date               : 12/02/2015 20:57:37
+   * Description        : Main program body
+   ******************************************************************************
+   *
+@@ -36,6 +36,9 @@
+ #include "stm32f4xx_hal.h"
+ #include "cmsis_os.h"
+ 
++#include <arm_math.h>
++#include <semphr.h>
++
+ /* USER CODE BEGIN Includes */
+ 
+ /* USER CODE END Includes */
+@@ -66,6 +69,62 @@
+ 
+ /* USER CODE BEGIN 0 */
+ 
++// make the startup script happy
++void _init(void) {}
++// make the dsp libs happy
++int __errno;
++
++// each uint32_t has 8 4bit nibbles representing
++static uint32_t *image_buffer;
++static uint32_t backbuffer[2][4*3*32];
++static volatile uint8_t backbuffer_index = 0;
++static xSemaphoreHandle xVsyncSemaphore = NULL;
++static xSemaphoreHandle xFrameReadySemaphore = NULL;
++
++#define SCAN_RATE (15)
++const uint32_t bit_angle_modulation_lookup[SCAN_RATE] = {
++		0x1u,
++		0x2u,
++		0x2u,
++		0x4u,
++		0x4u,
++		0x4u,
++		0x4u,
++		0x8u,
++		0x8u,
++		0x8u,
++		0x8u,
++		0x8u,
++		0x8u,
++		0x8u,
++		0x8u
++};
++
++static void set_pixel(uint16_t x, uint16_t y, uint8_t r, uint8_t g, uint8_t b)
++{
++	uint16_t offset = y * 4 * 3;
++	offset += x >> 3;
++	// shift by the remainder times 4
++	uint8_t shift = (x & 0x7u) << 2;
++	uint32_t mask = ~(0xFu << shift);
++	uint32_t pr = ((uint32_t)r & 0xFu) << shift;
++	uint32_t pg = ((uint32_t)g & 0xFu) << shift;
++	uint32_t pb = ((uint32_t)b & 0xFu) << shift;
++
++	image_buffer[offset + 0] = (image_buffer[offset + 0] & mask) | pr;
++	image_buffer[offset + 4] = (image_buffer[offset + 4] & mask) | pg;
++	image_buffer[offset + 8] = (image_buffer[offset + 8] & mask) | pb;
++}
++
++static void set_pixels_u32(uint16_t x, uint16_t y, uint32_t r, uint32_t g, uint32_t b)
++{
++	uint16_t offset = y * 4 * 3;
++	offset += x >> 3;
++	image_buffer[offset + 0] = r;
++	image_buffer[offset + 4] = g;
++	image_buffer[offset + 8] = b;
++}
++
+ /* USER CODE END 0 */
+ 
+ int main(void)
+@@ -91,6 +150,21 @@
+ 
+   /* USER CODE BEGIN 2 */
+ 
++  image_buffer = backbuffer[backbuffer_index];
++#ifdef TEST_PATTERN
++  for(int y=0;y<32;++y)
++	  for(int x=0;x<32;++x)
++	  {
++		  // layout: b - g - r
++		  image_buffer = backbuffer[0];
++		  set_pixel(x,y, x/2, y/2, (63-(x+y))/4);
++		  image_buffer = backbuffer[1];
++		  set_pixel(x,y, x/2, y/2, (63-(x+y))/4);
++	  }
++#endif
++  xVsyncSemaphore = xSemaphoreCreateCounting(1,0);
++  xFrameReadySemaphore = xSemaphoreCreateCounting(1,0);
++
+   /* USER CODE END 2 */
+ 
+   /* USER CODE BEGIN RTOS_MUTEX */
+@@ -257,19 +331,188 @@
+ }
+ 
+ /* USER CODE BEGIN 4 */
++static uint16_t line = 0;
++static uint8_t cur_linedata = 0;
++static uint32_t linedata[2][6];
++static volatile uint8_t scan = 0;
++static volatile uint32_t frame = 0;
++
++static volatile uint8_t transfer_pending = 0;
++static volatile uint16_t spi_transmit_line = 0;
++
++
++void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
++{
++	if(hspi == &hspi1)
++	{
++		// drive OE high
++		GPIOB->BSRR = GPIO_PIN_0;
++
++		GPIOC->ODR = spi_transmit_line & 0xF;
++		// latch data in
++		GPIOB->BSRR = GPIO_PIN_1;
++
++		// give the IOs some time to settle
++		__asm volatile (
++				" nop	\n"
++				" nop	\n"
++				" nop	\n"
++				" nop	\n"
++				);
++
++		// disable latches
++		GPIOB->BSRR = GPIO_PIN_1 << 16;
++
++		// drive OE low
++		GPIOB->BSRR = GPIO_PIN_0 << 16;
++
++		transfer_pending = 0;
++	}
++}
++
++uint32_t bitline(const uint32_t *image_data, const uint8_t bam_pattern)
++{
++	uint32_t v = 0;
++	const uint32_t bam_pattern32 = (uint32_t)bam_pattern;
++	for(uint8_t i=0;i<4;++i)
++	{
++		const uint32_t id = *image_data++;
++		uint32_t bam_shifter = bam_pattern32;
++		for(uint8_t j=0;j<8;++j)
++		{
++			v <<= 1;
++			if((id & bam_shifter)>0)
++				v |= 0x1u;
++			bam_shifter <<= 4;
++		}
++	}
++
++	return v;
++}
++
++void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
++	if(htim == &htim3)
++	{
++		if ( !transfer_pending )
++		{
++			transfer_pending = 1;
++
++			// dispatch SPI transfer in the background
++			spi_transmit_line = line;
++			HAL_SPI_Transmit_DMA(&hspi1, (uint8_t*)&linedata[cur_linedata][0], sizeof(uint32_t)*6);
++
++			++line;
++
++			// we only have 15 slots
++			if(line>0xF) {
++				line = 0;
++				++scan;
++			}
++			//  times oversampling
++			if(scan>SCAN_RATE) {
++				scan = 0;
++				++frame;
++
++				// switch buffers
++				if(xFrameReadySemaphore != NULL)
++				{
++					if (xSemaphoreTake(xFrameReadySemaphore, 0) == pdTRUE)
++					{
++						backbuffer_index ^= 1;
++					}
++				}
++				// trigger vSync
++				if(xVsyncSemaphore != NULL)
++				{
++					signed portBASE_TYPE highPrioWoven;
++					xSemaphoreGiveFromISR(xVsyncSemaphore, &highPrioWoven);
++				}
++			}
++
++			// switch to other buffer to populate SPI data
++			cur_linedata ^= 1;
++			/* prepare next line */
++			uint32_t *ld = &(linedata[cur_linedata][0]);
++
++			const uint32_t *display_buffer = &backbuffer[backbuffer_index^1][0];
++			const uint32_t *lp_top = display_buffer + line*4*3;
++			const uint32_t *lp_bottom = display_buffer + line*4*3 + 16*4*3;
++			const uint8_t bam_pattern = bit_angle_modulation_lookup[scan];
++
++			*ld++ = __REV(bitline(lp_bottom, bam_pattern));
++			*ld++ = __REV(bitline(lp_bottom+4, bam_pattern));
++			*ld++ = __REV(bitline(lp_bottom+8, bam_pattern));
++			*ld++ = __REV(bitline(lp_top, bam_pattern));
++			*ld++ = __REV(bitline(lp_top+4, bam_pattern));
++			*ld   = __REV(bitline(lp_top+8, bam_pattern));
++		}
++	}
++}
+ 
+ /* USER CODE END 4 */
+ 
++
+ void StartDefaultTask(void const * argument)
+ {
+-
+-  /* USER CODE BEGIN 5 */
+- 
+-  /* Infinite loop */
+-  for(;;)
+-  {
+-    osDelay(1);
+-  }
++	/* USER CODE BEGIN 5 */
++	float t = 0;
++	GPIOB->BSRR = GPIO_PIN_0 << 16;
++
++	HAL_TIM_Base_Start_IT(&htim3);
++
++	/* Infinite loop */
++	for(;;)
++	{
++		// wait forever for a vSync
++		if ( xVsyncSemaphore != NULL)
++		{
++			xSemaphoreTake(xVsyncSemaphore, portMAX_DELAY);
++		}
++		// adjust image buffer in case the backbuffer id has changed
++		image_buffer = &backbuffer[backbuffer_index][0];
++		for(int8_t y=0;y<32;++y)
++		{
++			uint32_t pr, pg, pb;
++			pr = pg = pb = 0;
++
++			// this is tricky. We will later push a u32 include all
++			// 8 values for r or g or b to the image buffer.
++			// most significant nibble is the offset 7.
++			// We will later left-shift by for each pixel, so we
++			// start at the top.
++			for(int8_t x=31;x>=0;--x)
++			{
++				float py = y - 15.f;
++				float px = x - 15.f;
++				float v1 = arm_sin_f32((float)px/ 4.0f  + t);
++				float v2 = arm_sin_f32((px/2.f * arm_sin_f32(t/2.f)
++				+ py/2.f * arm_cos_f32(t/3.f)) + t);
++				float cx = px / 5.f + 0.5f * arm_sin_f32(t/5.f);
++				float cy = py / 5.f + 0.5f * arm_cos_f32(t/3.f);
++				float sqrtfout;
++				arm_sqrt_f32(2.f * (cx*cx + cy*cy) + 1, &sqrtfout);
++				float v3 = arm_sin_f32(sqrtfout + t);
++
++				float v = (v1 + v2 + v3) / 3.f;
++
++				int8_t r = (int8_t)((arm_sin_f32(v*3.14f) + 1.f) * 7.5f);
++				int8_t g = (int8_t)((arm_sin_f32(v*7.14f + 1.5f) + 1.f) * 7.5f);
++				int8_t b = (int8_t)((arm_sin_f32(v*4.14f + 3.14f/3.f) + 1.f) * 7.5f);
++
++				// as we start from the most significant pixel,
++				// the left shift should be exactly what we need.
++				pr <<=4; pr |= (r & 0xFu);
++				pg <<=4; pg |= (g & 0xFu);
++				pb <<=4; pb |= (b & 0xFu);
++				if ( (x & 0x7u) == 0)
++				{
++					set_pixels_u32(x,y, pb, pg, pr);
++				}
++			}
++		}
++		xSemaphoreGive(xFrameReadySemaphore);
++		t += 0.2f;//2.f;//1.f/60.f;
++	}
+ 
+   /* USER CODE END 5 */ 
+ 

@@ -1,0 +1,4 @@
+../Core/Src/stm32l4xx_it.c:73:6:SysTick_Handler	4	static
+../Core/Src/stm32l4xx_it.c:93:6:TIM3_IRQHandler	8	static
+../Core/Src/stm32l4xx_it.c:107:6:SPI1_IRQHandler	8	static
+../Core/Src/stm32l4xx_it.c:121:6:DMA2_Channel4_IRQHandler	8	static
