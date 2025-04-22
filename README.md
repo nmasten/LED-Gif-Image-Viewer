@@ -5,3 +5,5 @@ Wiring and base code taken from [this guide](https://www.instructables.com/32x32
 
 Ported code from STM32F4 to STM32L476 microcontroller.
 
+![](demo.png "Demo Image")
+
